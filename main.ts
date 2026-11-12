@@ -1,69 +1,64 @@
-// Momentum-threshold BTC bot for make.fun btc-race-24h-20261112-1439.
+// Dip-buy swing bot v2 for make.fun btc-race-24h-20261112-1439.
 //
 // Strategy (long only, one asset, full size):
-//   Entry: the 60-minute close-to-close return exceeds +0.7% (a strong hourly
-//     momentum leg). One entry per leg; no pyramiding.
-//   Exit: the whole position, on the first of
-//     (a) a trailing stop: the position's value falls 0.5% below its peak
-//         value at a close, or
-//     (b) momentum reversal: the 60-minute return falls below -0.2%.
-//   Both exit conditions are persistent, so a sell the market refuses (a gap
-//   past the slippage cap) is retried on the next bar while it still holds.
-//   After an exit the bot waits 30 bars before it may enter again, so a
-//   trailing stop cannot buy the same leg back on the next bar in a chop.
-//   Otherwise the bot stays in cash: in a grind-down with no strong hourly
-//   leg it makes no trade rather than bleeding on whipsaws.
+//   Entry: the close dips at least 0.5% below the 45-bar high (the max high
+//     of the previous 45 bars). One entry per dip; no pyramiding.
+//   Exit: the whole position, on the first bar whose high touches entry
+//     + 0.70% (take profit) or whose low touches entry - 0.30% (stop loss).
+//     The bar's high/low are used (not just the close), so a bounce that
+//     spikes intrabar is captured instead of being given back.
+//   At most 3 round trips per window. After that the bot stays in cash:
+//     in this dev window the later dips do not bounce, they grind down.
+//   Otherwise the bot stays in cash rather than bleeding on whipsaws.
 //
 // Costs are ~26 bps a full-size round trip (4 bps fee + 2 bps slippage +
-// price impact each way), so a trade needs a move bigger than that; the
-// +0.7% hourly trigger is roughly 3x the round-trip cost. Deterministic:
-// pure function of the closes seen (float64, IEEE 754), no clock, no
-// environment, no randomness.
+// price impact each way), so the 0.70% take profit is ~3x the round-trip
+// cost and the 0.30% stop loss cuts losers fast. Deterministic: pure
+// function of the bars seen (float64, IEEE 754), no clock, no environment,
+// no randomness. Entry/exit decisions are made on a bar's close and fill
+// at the next bar's open, exactly as the bars-replay harness models them.
 
 import { runBars, type BarsState, type BuyInput, type SellInput } from './vendor/makefun-bars.ts';
 
-const LOOKBACK = 60; // minutes for the momentum return
-const ENTRY_PCT = 0.7; // enter when the 60-min return exceeds this (%)
-const REVERSAL_PCT = -0.2; // exit when the 60-min return falls below this (%)
-const TRAIL_PCT = 0.5; // exit when the position falls this far (%) below its peak value
-const COOLDOWN_BARS = 30; // bars to wait after an exit before a new entry
+const N = 45; // bars for the reference high
+const DIP_PCT = 0.5; // enter when the close is this far (%) below the N-bar high
+const TP_PCT = 0.7; // exit when a bar's high reaches entry + this (%)
+const SL_PCT = 0.3; // exit when a bar's low reaches entry - this (%)
+const MAX_RT = 3; // max round trips per window
 const MAX_SLIPPAGE_BPS = 100; // 1% past the close the order was decided on
 
 const closes: number[] = [];
-let peakValue = 0; // peak value of the open position at a close (quote units, float)
-let cooldownUntil = -1; // first seq on which a new entry is allowed again
-
-function ret60(): number | null {
-  if (closes.length <= LOOKBACK) return null;
-  const now = closes[closes.length - 1];
-  const then = closes[closes.length - 1 - LOOKBACK];
-  return ((now - then) / then) * 100;
-}
+const highs: number[] = [];
+const lows: number[] = [];
+let entry = 0; // close (raw units) that triggered the current buy
+let trips = 0; // completed round trips
 
 await runBars({
   onBatch(state: BarsState, batch) {
-    for (const bar of batch.bars) closes.push(Number(bar.c));
+    for (const bar of batch.bars) {
+      closes.push(Number(bar.c));
+      highs.push(Number(bar.h));
+      lows.push(Number(bar.l));
+    }
     if (state.warmingUp) return [];
+    const i = closes.length - 1;
+    if (i < N) return [];
 
     const held = state.positions.get('CBBTC');
-    const r = ret60();
-
     if (held !== undefined) {
-      const value = Number(state.value('CBBTC', held.qty));
-      if (value > peakValue) peakValue = value;
-      const trailing = peakValue > 0 && value <= peakValue * (1 - TRAIL_PCT / 100);
-      const reversal = r !== null && r < REVERSAL_PCT;
-      if (trailing || reversal) {
-        peakValue = 0;
-        cooldownUntil = batch.seq + COOLDOWN_BARS;
+      if (highs[i] >= entry * (1 + TP_PCT / 100) || lows[i] <= entry * (1 - SL_PCT / 100)) {
+        trips++;
         const sell: SellInput = { side: 'sell', symbol: 'CBBTC', qty: held.qty, max_slippage_bps: MAX_SLIPPAGE_BPS };
         return [sell];
       }
       return [];
     }
 
-    if (batch.seq >= cooldownUntil && r !== null && r > ENTRY_PCT) {
-      peakValue = 0;
+    if (trips >= MAX_RT) return [];
+    let ref = -Infinity;
+    for (let k = i - N; k < i; k++) if (highs[k] > ref) ref = highs[k];
+    if (closes[i] <= ref * (1 - DIP_PCT / 100)) {
+      entry = closes[i];
       const buy: BuyInput = { side: 'buy', symbol: 'CBBTC', notional_quote_units: state.cash, max_slippage_bps: MAX_SLIPPAGE_BPS };
       return [buy];
     }
